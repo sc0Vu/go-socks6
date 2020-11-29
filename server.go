@@ -33,6 +33,7 @@ type Server struct {
 	sleepTime   time.Duration
 	ln          net.Listener
 	od          sync.Once
+	mx          sync.Mutex
 	ch          chan struct{}
 	conns       map[net.Conn]net.Conn
 }
@@ -42,6 +43,7 @@ func NewSocksServer(dialTimeout, sleepTime time.Duration, connsSize int) Server 
 		dialTimeout: dialTimeout,
 		sleepTime:   sleepTime,
 		od:          sync.Once{},
+		mx:          sync.Mutex{},
 		ch:          make(chan struct{}),
 		conns:       make(map[net.Conn]net.Conn, connsSize),
 	}
@@ -97,18 +99,19 @@ func (srv *Server) handshake(conn net.Conn) (err error) {
 // and the data should be: VN, CD, PORT, IP
 // spec: https://www.openssh.com/txt/socks4.protocol
 func (srv *Server) handshake4(conn net.Conn) (err error) {
-	var n int
-	buf := make([]byte, 8)
-	n, err = conn.Read(buf)
+	buf := make([]byte, 7)
+	_, err = conn.Read(buf)
 	if err != nil {
 		return
 	}
-	if n != 8 {
-		return ErrReadTruncatedBuffer
-	}
-	cmd := buf[0]
-	port := binary.BigEndian.Uint16(buf[1:3])
-	ip := net.IP(buf[3:7])
+	const (
+		CD   = 0
+		PORT = 1
+		IP   = 3
+	)
+	cmd := buf[CD]
+	port := binary.BigEndian.Uint16(buf[PORT:3])
+	ip := net.IP(buf[IP:7])
 	if cmd != 1 {
 		err = ErrWrongSocksVersion
 		return
@@ -122,18 +125,24 @@ func (srv *Server) handshake4(conn net.Conn) (err error) {
 	if err != nil {
 		return
 	}
+	srv.mx.Lock()
 	srv.conns[conn] = sconn
+	srv.mx.Unlock()
 	go func(conn, sconn net.Conn) {
 		go srv.netCopy(sconn, conn)
 		srv.netCopy(conn, sconn)
 		sconn.Close()
 		conn.Close()
+		srv.mx.Lock()
 		delete(srv.conns, conn)
+		srv.mx.Unlock()
 	}(conn, sconn)
 	// write socks result
-	buf[0] = 0
-	buf[1] = success
-	conn.Write(buf)
+	res := make([]byte, 8)
+	res[0] = 0
+	res[1] = success
+	copy(res[2:], buf[1:])
+	conn.Write(res)
 	return
 }
 
@@ -159,6 +168,7 @@ func (srv *Server) Serve(ln net.Listener) error {
 		go func() {
 			if err := srv.handshake(conn); err != nil {
 				// failed to handshake
+				conn.Close()
 			}
 		}()
 	}
@@ -180,8 +190,8 @@ func (srv *Server) ListenAndServe(hostname string) error {
 // Close socks server
 func (srv *Server) Close() {
 	srv.od.Do(func() {
-		srv.ln.Close()
 		close(srv.ch)
+		srv.ln.Close()
 		for oc, sc := range srv.conns {
 			oc.Close()
 			sc.Close()
